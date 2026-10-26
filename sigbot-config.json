@@ -1,0 +1,20 @@
+{
+  "_help": "Every key is optional; defaults live in sigbot/bot.py (DEFAULTS). Prices are probabilities 0-1, sizes are SUSQies.",
+  "tournament_slug": "midterm-elections",
+  "fair_values_file": "fair_values.json",
+  "max_model_age_hours": 36,
+  "loop_seconds": 20,
+
+  "take_edge": 0.03,
+  "exit_mode": "profit",
+  "take_profit_pct": 0.25,
+  "exit_edge": 0.0,
+  "kelly_mult": 0.5,
+  "max_position_value": 15000,
+  "max_position_frac": 0.20,
+  "max_group_value": 15000,
+  "max_gross_exposure_frac": 0.95,
+
+  "make_enabled": false,
+  "arb_enabled": true
+}
