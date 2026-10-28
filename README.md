@@ -1,101 +1,121 @@
-# 2026 Susquehanna Predictions Cup forecast
+# Election Prediction Market Trading Bot
 
-## Trading bot (sigbot)
+An automated trading bot I built for the **2026 Susquehanna (SIG) Predictions Cup**, a competition where participants trade on the outcomes of the 2026 U.S. midterm elections. It forecasts every House, Senate and governor race, compares those forecasts with the competition's market prices, and buys contracts that look underpriced.
 
-`election_forecast.py` now also writes `fair_values.json`: one entry per competition
-contract with the model probability and, where Kalshi lists the race, the Kalshi ticker
-(verified live). `sigbot/` reads it and trades through the official API (bots are
-allowed by the official rules, s.6).
+## The idea in plain English
 
-```powershell
-.\run-bot.ps1            # forecast, then dry-run (orders logged to trades.jsonl)
-.\run-bot.ps1 --live     # real orders; refused while the STOP file exists
-.\.venv313\Scripts\python.exe -m sigbot fair     # fair value vs book for every contract
-.\.venv313\Scripts\python.exe -m sigbot status   # positions, P&L, rank
-.\stop.ps1                                       # kill switch: bot stops and cancels resting orders
+A **prediction market** lets people buy and sell contracts on future events. A contract like *"Democrats win the Texas Senate race"* pays **1** if it happens and **0** if it doesn't. The price is the market's estimate of the chance it happens: a price of 0.40 means traders think it's about 40% likely.
+
+If you can estimate that chance better than the price suggests, you have an **edge**. Say you think the real chance is 50% and the contract sells for 0.40. Buying it at 0.40 makes money on average, because over many bets like it you win half the time and collect 1 each time.
+
+The bot does this automatically for every race in the competition:
+
+1. **Estimate the real chance of each outcome** (the "fair value"), using its own election model and prices on real-money prediction markets.
+2. **Compare the fair value with the competition's prices.**
+3. **Buy when a contract is clearly cheaper than its fair value**, and sell later when the gap closes or the position is up enough.
+4. **Size each bet carefully**, so no single race or wrong forecast can wipe out the account.
+
+## How it works
+
+```
+public polls & results ─► election model ─┐
+                                          ├─► fair value per contract ─► compare with competition prices ─► trade
+Kalshi / Polymarket prices ───────────────┘
 ```
 
-How fair value is formed for each contract:
+### 1. The election forecast (`election_forecast.py`)
 
-- Kalshi and model are blended 3:1. The model's own validation is a calibration
-  benchmark, not a backtest, so the deep real-money market gets more weight.
-- If the model is more than 15 points from Kalshi it is dropped for that contract
-  (e.g. VT governor: model 1% R vs Kalshi 74% R; the model can't see Phil Scott's
-  personal vote). About 19 of 174 overlapping contracts hit this guard.
-- Races the two-party model can't describe (three-way, ranked-choice, same-party
-  top-two, missing nominee, all "Independent Party" contracts) use Kalshi only.
-- Contracts with no Kalshi market (~42, mostly safe seats) use the model alone, need
-  an 8-point edge instead of 3, and bet half size.
-- Model values older than 36 hours are ignored; re-run the forecast daily.
-- DEM and REP contracts on the same race share one exposure cap (`max_group_value`).
+- Downloads public polling, past results and race data (sources below).
+- Estimates the expected margin in each race from polls, the national generic ballot, past results and incumbency.
+- Runs **200,000 simulated elections**. Races are linked: a national polling miss shifts every race in the same direction, and nearby states move together. This matters because polling errors are usually shared, not independent.
+- Counts how often each candidate wins, and how often each party controls the House and the Senate, across all the simulations.
 
-Settings live in `sigbot-config.json`. Check the resolution text for Nebraska Senate:
-whether an Osborn win resolves the *Democratic* contract decides how it should be priced.
+### 2. Fair value (`sigbot/fair.py`)
 
-`trader.py` (one-time noon executor) is superseded by sigbot and left unchanged.
+The model's numbers are blended with prices from **Kalshi**, a large real-money prediction market, because a market where people bet real money is hard to beat:
 
-## Forecast
+- Kalshi and the model are weighted **3 to 1**.
+- If the model disagrees with Kalshi by more than 15 points, the bot trusts Kalshi alone for that race. For example, the model can't see that a popular Republican governor in Vermont wins far more votes than his party usually does there.
+- Races the model can't handle, such as three-way races or ranked-choice voting, use Kalshi only.
+- Races with no Kalshi market use the model alone, but need a bigger edge and get smaller bets.
+- Forecasts older than 36 hours are ignored, so the bot never trades on stale data.
 
-`election_forecast.py` is recommendation-only. It downloads and caches public
-polling/race data, reads competition markets with GET requests, runs exactly
-200,000 reproducible joint simulations, and writes `forecast-report.txt` and
-`forecast-report.json`. It never imports or calls the live order executor.
+### 3. Trading (`sigbot/`)
 
-## Environment
+Every 20 seconds the bot checks the competition's prices and can do three things:
 
-Tested with standard CPython 3.13.7 and NumPy 2.5.3 in `.venv313`. NumPy is the
-only third-party dependency. Pandas, SciPy, scikit-learn, matplotlib, and a
-Bayesian framework are not used: standard-library code handles CSVs, caching,
-metrics, and calibration; NumPy handles the vectorized hierarchical simulation.
+- **Take mispriced offers.** It buys YES when the price is at least 3 points below fair value, and buys NO (bets against the outcome) when the price is at least 3 points above it.
+- **Arbitrage.** When a market has several outcomes and exactly one must happen, buying one of each costs less than 1 if their prices add up to less than 1. The bot buys every outcome and locks in the difference whatever the result.
+- **Find longshots** (`sigbot longshots`). It lists cheap contracts whose real chance is higher than their price suggests.
+
+## Risk controls
+
+- **Bet sizing with half-Kelly.** The [Kelly criterion](https://en.wikipedia.org/wiki/Kelly_criterion) gives the bet size that grows a bankroll fastest. The bot bets half of that to stay safe when its estimates are wrong.
+- **Position limits.** Each contract is capped at 20% of the account, and the Democratic and Republican contracts on one race share a single cap.
+- **Dry run first.** By default the bot only logs the trades it *would* make. Real orders need the `--live` flag.
+- **Kill switch.** Running `stop.ps1` creates a `STOP` file, which stops the bot and cancels its open orders.
+- **Rate limits and a hard stop** before the competition closes.
+
+## Tech stack
+
+- **Python 3.13**, using the standard library for almost everything
+- **NumPy** for the vectorized election simulation (its only third-party dependency)
+- The competition's REST API, plus Kalshi and Polymarket's public APIs
+- `unittest` tests for the strategy logic, the forecast, and the bot loop
+
+The trading rules in `sigbot/strategy.py` are pure functions with no network calls, so they can be unit-tested on their own.
+
+## Running it
+
+You need an API key for the competition platform. The code reads it from an environment variable, and it is never stored in the repo.
 
 ```powershell
 py -3.13 -m venv .venv313
 .\.venv313\Scripts\python.exe -m pip install -r requirements.txt
+$env:SUPER_MARKET_API_KEY = "<your key>"
+
+.\run-forecast.ps1                                  # run the election model
+.\run-bot.ps1                                       # forecast, then a dry run (no real orders)
+.\run-bot.ps1 --live                                # place real orders
+.\.venv313\Scripts\python.exe -m sigbot fair        # fair value vs. market price for every contract
+.\.venv313\Scripts\python.exe -m sigbot status      # positions, profit/loss and rank
+.\.venv313\Scripts\python.exe -m sigbot longshots   # cheap contracts worth a look
+.\stop.ps1                                          # kill switch
 ```
 
-## Run
-
-In the authenticated PowerShell window:
+Tests and model validation:
 
 ```powershell
-cd C:\Users\akach\Downloads\sig-cup-recommender
-.\run-forecast.ps1
-```
-
-The report records source URLs, retrieval timestamps, hashes, current generic
-ballot and race polls, historical baselines, incumbency, time to Election Day,
-resolution criteria, executable asks, spread, fees, liquidity, numerical model
-uncertainty, and Monte Carlo sampling error. Missing polls remain missing; no
-subjective confidence rating is invented.
-
-Public inputs:
-
-- https://github.com/ElectIndex/26_us_forecast_data
-- https://github.com/fivethirtyeight/data/tree/master/forecast-methodology
-- https://electionlab.mit.edu/data
-- https://www.fec.gov/introduction-campaign-finance/election-results-and-voting-information/
-
-The simulation uses seed `20261001` with shared national, regional, and
-race-specific errors. House and Senate control are calculated in the same draws.
-Related/complementary contracts share one exposure group. A recommendation is
-actionable only when exact resolution text supports its party mapping and its
-conservative edge—using the adverse end of the model interval—clears the minimum.
-
-Validation uses expanding-year holdouts with calibration choices fitted only on
-earlier years and reports Brier score, log loss, calibration bins, raw-reference,
-and 50% baselines. The public historical file has forecast probabilities and
-outcomes, not complete snapshots of this model's features; therefore validation
-is a limited calibration benchmark, not a direct backtest of the 2026 model.
-
-Offline validation and tests:
-
-```powershell
-.\.venv313\Scripts\python.exe .\election_forecast.py --validate-only
 .\.venv313\Scripts\python.exe -m unittest -v
+.\.venv313\Scripts\python.exe .\election_forecast.py --validate-only
 ```
 
-Public downloads use a six-hour cache, request pacing, `Retry-After`, and bounded
-read retries. Order submissions are never retried by this model because it makes
-no write requests. Existing trading guards and limits remain in the legacy
-executor; `STOP` is preserved. Credentials, environments, caches, logs, reports,
-and authorization/order state are ignored by Git.
+Settings such as edge thresholds, bet sizes and limits are in `sigbot-config.json`.
+
+## Project layout
+
+| File | What it does |
+|---|---|
+| `election_forecast.py` | Election model: downloads data, simulates races, writes fair values |
+| `sigbot/fair.py` | Blends the model with Kalshi and Polymarket prices |
+| `sigbot/strategy.py` | Trading decisions: when to buy or sell, and how much |
+| `sigbot/longshot.py` | Finds underpriced cheap contracts |
+| `sigbot/bot.py` | Main loop: prices, positions, limits, kill switch |
+| `sigbot/client.py` | API client with rate limiting |
+| `recommender.py`, `trader.py` | Earlier read-only recommender and one-time order executor, replaced by `sigbot` |
+| `test_*.py` | Unit tests |
+
+## Limitations
+
+- **The model was checked for calibration, not backtested.** The public historical data has past forecasts and outcomes, but not the inputs this model uses. So I could check that its probabilities are realistic, using the Brier score and calibration bins, but not replay the 2026 strategy on past elections.
+- **Simple race model.** It treats races as two-party contests, which is why three-way and ranked-choice races fall back to Kalshi.
+- **It depends on Kalshi** for most fair values. When Kalshi is wrong, the bot is wrong too.
+
+## Data sources
+
+- [ElectIndex 2026 forecast data](https://github.com/ElectIndex/26_us_forecast_data)
+- [FiveThirtyEight forecast methodology data](https://github.com/fivethirtyeight/data/tree/master/forecast-methodology)
+- [MIT Election Data and Science Lab](https://electionlab.mit.edu/data)
+- [FEC election results](https://www.fec.gov/introduction-campaign-finance/election-results-and-voting-information/)
+
+Bots are allowed by the competition's official rules (section 6).
