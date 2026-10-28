@@ -146,8 +146,8 @@ class Client:
     def pnl(self, slug):
         return self.get(f"/tournaments/{slug}/portfolio/pnl", period="all")
 
-    def leaderboard(self, slug, limit=10):
-        return self.get(f"/tournaments/{slug}/leaderboard", limit=limit)
+    def leaderboard(self, slug, limit=10, offset=0):
+        return self.get(f"/tournaments/{slug}/leaderboard", limit=limit, offset=offset)
 
     # ---- writes ----------------------------------------------------------
     def place_order(self, exchange_id, side, action, quantity, price, tournament_id, expires_at=None):

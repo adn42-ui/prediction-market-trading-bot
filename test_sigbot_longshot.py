@@ -99,13 +99,13 @@ class Longshots(unittest.TestCase):
         self.assertEqual(c.cancelled_ids, [2])
         self.assertEqual(c.cancelled, 0)   # no blanket cancel-all
 
-    def run_buy(self, argv, book_asks):
+    def run_buy(self, argv, book_asks, cash=7005.09):
         from unittest import mock
         import contextlib, io
         from sigbot import __main__ as cli
         c = FakeClient()
         c.books["917"] = {"bids": [], "asks": [{"price": p, "quantity": q} for p, q in book_asks]}
-        c.account = lambda tid=None: {"balance": 7005.09}
+        c.account = lambda tid=None: {"balance": cash}
         c.place_order = lambda *a: (c.orders.append(a) or
                                     {"orderId": 9, "open": True, "quantityTraded": 2018, "totalCost": 133.72,
                                      "remainingQuantity": a[3] - 2018})
@@ -152,6 +152,21 @@ class Longshots(unittest.TestCase):
         bot.step()
         self.assertEqual(sorted(o[0] for o in c.orders[1:]), ["101", "103"])
         self.assertNotIn("917", [o[0] for o in c.orders])
+
+    def test_buy_says_not_enough_cash_instead_of_nothing_offered(self):
+        with open(self.fv_path, "w") as fh:
+            json.dump({"markets": {}}, fh)
+        argv = ["917", "--side", "yes", "--spend", "7000", "--max-price", "0.07"]
+        with self.assertRaises(SystemExit) as stop:
+            self.run_buy(argv, [(0.065, 1000)], cash=0.02)
+        self.assertIn("Not enough cash", str(stop.exception))
+
+    def test_buy_reports_cheapest_offer_when_too_expensive(self):
+        with open(self.fv_path, "w") as fh:
+            json.dump({"markets": {}}, fh)
+        with self.assertRaises(SystemExit) as stop:
+            self.run_buy(["917", "--side", "yes", "--spend", "7000", "--max-price", "0.07"], [(0.09, 1000)])
+        self.assertIn("cheapest offer now: 0.09", str(stop.exception))
 
     def test_bot_never_trades_held_exchange(self):
         with open(self.fv_path, "w") as fh:

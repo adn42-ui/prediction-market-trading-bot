@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--side", choices=["yes", "no"], help="buy: which side")
     ap.add_argument("--spend", type=float, help="buy: SUSQies to spend")
     ap.add_argument("--confirm", action="store_true", help="buy: actually place the order")
+    ap.add_argument("--at", type=int, nargs="+", metavar="RANK",
+                    help="status: also show the P&L at these ranks, e.g. --at 10 50 100 250")
     ap.add_argument("--rest", type=float, default=0, metavar="HOURS",
                     help="buy: leave the unfilled part resting at --max-price for HOURS, waiting for sellers")
     args = ap.parse_args()
@@ -109,9 +111,14 @@ def main():
                     print(f"  {abs(p['quantity']):>7.0f} {side:3} @ {p['avgCost']:.3f} -> {fmt(p['currentPrice'])}  "
                           f"P&L {p['unrealizedPnl']:+,.0f}  {p['marketTitle'][:50]} {p['option'] or ''}")
             lb = client.leaderboard(slug, limit=5)
-            print(f"My rank: {lb['myRank']} of {lb['total']}")
+            print(f"My rank: {lb['myRank']} of {lb['total']}  (ranked by P&L)")
             for e in lb["leaderboard"]:
                 print(f"  #{e.get('rank')} {e.get('username')}  {e.get('pnl', e.get('finalTotalValue'))}")
+            # P&L needed to reach each milestone rank
+            for rank in args.at or []:
+                row = client.leaderboard(slug, limit=1, offset=rank - 1)["leaderboard"]
+                if row:
+                    print(f"  rank {rank:>4}: P&L {row[0].get('pnl', row[0].get('finalTotalValue')):>12,.0f}")
 
         elif args.command == "cancel-all":
             slug, tid, _ = resolve_tournament(client, cfg["tournament_slug"])
@@ -145,8 +152,14 @@ def main():
                 with open(cfg["fair_values_file"], encoding="utf-8-sig") as fh:
                     labels = {k: v.get("label") for k, v in json.load(fh).get("markets", {}).items()}
             label = labels.get(args.exchange_id) or f"exchange {args.exchange_id}"
+            if budget < args.max_price:
+                sys.exit(f"Not enough cash: you have {cash:,.2f}, and one share costs up to {args.max_price}. "
+                         f"Sell something first, then retry.")
             if not plan and not args.rest:
-                sys.exit(f"Nothing offered on {args.side.upper()} at or below {args.max_price} for {label}. "
+                best =(book.get("asks") or [{}])[0].get("price") if args.side == "yes" else \
+                    (round(1 - book["bids"][0]["price"], 3) if book.get("bids") else None)
+                sys.exit(f"Nothing offered on {args.side.upper()} at or below {args.max_price} for {label}"
+                         f"{f' (cheapest offer now: {best})' if best is not None else ' (no offers at all)'}. "
                          f"Add --rest HOURS to leave a buy order waiting at {args.max_price}.")
             plan = plan or {"qty": 0, "cost": 0.0, "avg": 0.0, "worst": args.max_price, "payout": 0}
             print(f"{label}\n  now: buy {plan['qty']:,} {args.side.upper()} for {plan['cost']:,.2f} "
@@ -177,7 +190,7 @@ def main():
             else:
                 res = client.place_order(args.exchange_id, args.side, "buy", plan["qty"], plan["worst"], tid, iso_in(30))
             print(f"  filled {res.get('quantityTraded', 0):,} for {res.get('totalCost', 0):,.2f}"
-                  + (f"; {res.get('remainingQuantity', 0):,.0f} resting (order {res.get('orderId')})"
+                  + (f"; {abs(res.get('remainingQuantity') or 0):,.0f} resting (order {res.get('orderId')})"   # NO side is signed negative
                      if res.get("open") and rest_qty else "  (rest expires in 30s)" if res.get("open") else ""))
             if res.get("quantityTraded") or (rest_qty and res.get("open")):
                 add_hold(args.exchange_id, label, cfg["hold_file"])

@@ -673,9 +673,11 @@ def make_recommendations(api: ReadOnlyAPI, market_rows: list[dict], tid: str, fo
 
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
-# Kalshi is a deep real-money market; this model's validation is only a calibration benchmark
-# (see validation_report), so the blend leans on Kalshi wherever it lists the race.
-FAIR_WEIGHTS = {"kalshi": 3, "model": 1}
+POLYMARKET_API = "https://gamma-api.polymarket.com"
+# Kalshi and Polymarket are real-money markets; this model's validation is only a calibration
+# benchmark (see validation_report), so the blend leans on whichever market lists the race.
+FAIR_WEIGHTS = {"kalshi": 3, "polymarket": 3, "model": 1}
+STATE_SLUGS = {abbr: name.lower().replace(" ", "-") for name, abbr in STATE_NAMES.items()}
 TAKE_EDGE_WITH_KALSHI = float(os.getenv("TAKE_EDGE_WITH_KALSHI", "0.03"))
 TAKE_EDGE_MODEL_ONLY = float(os.getenv("TAKE_EDGE_MODEL_ONLY", "0.08"))
 
@@ -689,6 +691,39 @@ def kalshi_candidates(kind: str, key: str, party: str) -> list[str]:
     if seat == "SEN": return [f"SENATE{state}-26-{s}"]
     if seat == "GOV": return [f"GOVPARTY{state}-26-{s}", f"GOVPARTY{state}-27-{s}"]  # KS is dated by inauguration
     return [f"HOUSE{state}{int(seat)}-26-{s}", f"HOUSE{state}AL-26-{s}"]
+
+
+def polymarket_candidates(kind: str, key: str, party: str) -> list[str]:
+    """Polymarket's election market slugs follow fixed patterns (checked 2026-10-26), e.g.
+    will-the-republican-party-win-the-co-04-house-seat, will-the-democrats-win-the-maine-senate-race-in-2026."""
+    if party == "IND": return []   # candidate-named markets; no fixed pattern
+    adj, plural = ("democratic", "democrats") if party == "DEM" else ("republican", "republicans")
+    if kind == "chamber":
+        chamber = "house" if key == "US House" else "senate"
+        return [f"will-the-{adj}-party-control-the-{chamber}-after-the-2026-midterm-elections"]
+    state, seat = key.split("-")
+    if seat in ("SEN", "GOV"):
+        office = "senate" if seat == "SEN" else "governor"
+        return [f"will-the-{plural}-win-the-{STATE_SLUGS[state]}-{office}-race-in-2026"]
+    return [f"will-the-{adj}-party-win-the-{state.lower()}-{seat}-house-seat",
+            f"will-the-{adj}-party-win-the-{state.lower()}-al-house-seat"]   # at-large seats
+
+
+def verify_polymarket(slugs: list[str]) -> set[str]:
+    """Keeps only slugs Polymarket lists as open with prices (bulk lookup, 25 per call)."""
+    live: set[str] = set()
+    unique = sorted(set(slugs))
+    for i in range(0, len(unique), 25):
+        url = f"{POLYMARKET_API}/markets?" + urllib.parse.urlencode([("slug", s) for s in unique[i:i+25]] + [("limit", 50)])
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "sig-cup-election-forecast/2.0"})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                live |= {m["slug"] for m in json.load(response)
+                         if m.get("active") and not m.get("closed") and m.get("outcomePrices")}
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            print(f"  Polymarket lookup failed for batch {i//25+1}: {error}", flush=True)
+        time.sleep(0.25)
+    return live
 
 
 def verify_kalshi(tickers: list[str]) -> set[str]:
@@ -742,6 +777,12 @@ def fair_values(recommendations: list[dict], run_at: str, ind_names: dict[str,st
         for r in recommendations:
             if r.get("mapping", {}).get("key") == key and r["mapping"]["yes_party"] == "IND" and r.get("exchange_id") in wanted:
                 wanted[r["exchange_id"]] = [ticker]
+    # Races Kalshi doesn't list get a Polymarket check instead (CO-04: model 0.98 R, Polymarket 0.66).
+    no_kalshi = {r["exchange_id"]: polymarket_candidates(r["mapping"]["kind"], r["mapping"]["key"], r["mapping"]["yes_party"])
+                 for r in recommendations
+                 if r.get("exchange_id") in wanted and not any(t in live for t in wanted[r["exchange_id"]])}
+    print(f"Matching {len(no_kalshi)} markets without Kalshi to Polymarket...", flush=True)
+    poly_live = verify_polymarket([s for ss in no_kalshi.values() for s in ss])
     markets: dict[str,Any] = {}
     for r in recommendations:
         xid = r.get("exchange_id")
@@ -749,19 +790,24 @@ def fair_values(recommendations: list[dict], run_at: str, ind_names: dict[str,st
         entry: dict[str,Any] = {"label": r["market"], "group": f"{r['mapping']['kind']}:{r['mapping']['key']}"}
         ticker = next((t for t in wanted[xid] if t in live), None)
         if ticker: entry["kalshi"] = ticker
+        slug = next((s for s in no_kalshi.get(xid, []) if s in poly_live), None)
+        if slug: entry["polymarket"] = slug   # YES outcome is listed first, which sigbot reads by default
         if r.get("estimated_probability") is not None and not r.get("model_caveat"):
             entry["model"] = round(r["estimated_probability"], 4)
             entry["model_range"] = [round(x, 4) for x in r["uncertainty_range"]]
         if r.get("model_caveat"): entry["model_caveat"] = r["model_caveat"]
-        if "kalshi" not in entry and "model" not in entry: continue
+        if not ({"kalshi", "polymarket", "model"} & set(entry)): continue
         entry["weights"] = FAIR_WEIGHTS
-        entry["take_edge"] = TAKE_EDGE_WITH_KALSHI if ticker else TAKE_EDGE_MODEL_ONLY
-        if not ticker:
+        market_backed = bool(ticker or slug)
+        entry["take_edge"] = TAKE_EDGE_WITH_KALSHI if market_backed else TAKE_EDGE_MODEL_ONLY
+        if not market_backed:
             entry["size_mult"] = 0.5   # no market to catch a model blind spot (e.g. VT-GOV): bet smaller
         markets[xid] = entry
-    kal = sum("kalshi" in e for e in markets.values()); mod = sum("model" in e for e in markets.values())
-    print(f"fair_values: {len(markets)} markets ({kal} with Kalshi, {mod} with model, "
-          f"{sum('kalshi' not in e for e in markets.values())} model-only)", flush=True)
+    kal = sum("kalshi" in e for e in markets.values()); poly = sum("polymarket" in e for e in markets.values())
+    mod = sum("model" in e for e in markets.values())
+    only = sum(not ({"kalshi", "polymarket"} & set(e)) for e in markets.values())
+    print(f"fair_values: {len(markets)} markets ({kal} with Kalshi, {poly} with Polymarket, {mod} with model, "
+          f"{only} model-only)", flush=True)
     return {"generated_at": run_at, "source": "election_forecast.py", "weights": FAIR_WEIGHTS, "markets": markets}
 
 

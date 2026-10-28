@@ -112,15 +112,44 @@ class Bridge(unittest.TestCase):
         self.assertEqual(ind["recommendation"], "NO TRADE")
         self.assertIn("independent", ind["model_caveat"])
         with mock.patch.object(ef, "verify_kalshi", return_value=set()), \
+             mock.patch.object(ef, "verify_polymarket", return_value=set()), \
              mock.patch.object(ef, "kalshi_independents", return_value={"TX-SEN": "SENATETX-26-IND"}):
             out = ef.fair_values(recs, "2026-10-25T00:00:00+00:00", {"TX-SEN": "Some Independent"})
         self.assertEqual(out["markets"]["14"]["kalshi"], "SENATETX-26-IND")
         self.assertNotIn("model", out["markets"]["14"])
 
+    def test_polymarket_slugs(self):
+        self.assertEqual(ef.polymarket_candidates("race", "CO-04", "REP"),
+                         ["will-the-republican-party-win-the-co-04-house-seat",
+                          "will-the-republican-party-win-the-co-al-house-seat"])
+        self.assertEqual(ef.polymarket_candidates("race", "NH-GOV", "DEM"),
+                         ["will-the-democrats-win-the-new-hampshire-governor-race-in-2026"])
+        self.assertEqual(ef.polymarket_candidates("race", "ME-SEN", "REP"),
+                         ["will-the-republicans-win-the-maine-senate-race-in-2026"])
+        self.assertEqual(ef.polymarket_candidates("chamber", "US Senate", "DEM"),
+                         ["will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections"])
+        self.assertEqual(ef.polymarket_candidates("race", "NE-SEN", "IND"), [])
+
+    def test_polymarket_backs_races_kalshi_skips(self):
+        recs, _, _ = self.run_recs()
+        kalshi = {"SENATETX-26-D"}
+        poly = {"will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections",
+                "will-the-democrats-win-the-texas-senate-race-in-2026"}   # TX listed too, but Kalshi has it
+        with mock.patch.object(ef, "verify_kalshi", return_value=kalshi), \
+             mock.patch.object(ef, "verify_polymarket", return_value=poly) as vp:
+            m = ef.fair_values(list(recs.values()), "2026-10-26T00:00:00+00:00")["markets"]
+        asked = vp.call_args[0][0]
+        self.assertNotIn("will-the-democrats-win-the-texas-senate-race-in-2026", asked)  # only no-Kalshi races
+        self.assertEqual(m["13"]["polymarket"], "will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections")
+        self.assertEqual(m["13"]["take_edge"], ef.TAKE_EDGE_WITH_KALSHI)   # market-backed now
+        self.assertNotIn("size_mult", m["13"])
+        self.assertNotIn("polymarket", m["11"])
+
     def test_fair_values_export(self):
         recs, _, _ = self.run_recs()
         live = {"SENATETX-26-D", "SENATENE-26-D"}  # pretend Kalshi lists TX and NE, not the Senate-control one
-        with mock.patch.object(ef, "verify_kalshi", return_value=live):
+        with mock.patch.object(ef, "verify_kalshi", return_value=live), \
+             mock.patch.object(ef, "verify_polymarket", return_value=set()):
             out = ef.fair_values(list(recs.values()), "2026-10-25T00:00:00+00:00")
         m = out["markets"]
         self.assertEqual(out["generated_at"], "2026-10-25T00:00:00+00:00")

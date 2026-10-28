@@ -135,6 +135,20 @@ class BotLoop(unittest.TestCase):
         bot.step()
         self.assertEqual([o[0] for o in c.orders], ["103"])
 
+    def test_co04_model_dropped_against_polymarket(self):
+        # the real case from 2026-10-26: model 0.98 that Boebert wins, Polymarket 0.66
+        from unittest import mock
+        from sigbot import fair as fair_mod
+        slug = "will-the-republican-party-win-the-co-04-house-seat"
+        self.write_fv({"markets": {"897": {"label": "R CO-04", "polymarket": slug, "model": 0.977,
+                                           "model_range": [0.881, 0.998], "weights": {"polymarket": 3, "model": 1}}}})
+        with mock.patch.object(fair_mod, "polymarket_prob", return_value=0.66):
+            fv = fair_mod.FairValues(self.fv_path, log=lambda m: None)
+            fair, srcs = fv.get("897")
+        self.assertAlmostEqual(fair, 0.66)
+        self.assertEqual(set(srcs), {"polymarket"})
+        self.assertEqual(fv.bounds("897", fair, srcs), (0.66, 0.66))   # market price, not the model's range
+
     def test_model_dropped_when_far_from_kalshi(self):
         from unittest import mock
         from sigbot import fair as fair_mod
